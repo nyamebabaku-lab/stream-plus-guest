@@ -1,0 +1,211 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+<title>Join the live show · Stream Plus</title>
+<meta name="description" content="Join a Stream Plus live show as a guest from your phone or laptop.">
+<style>
+  :root { color-scheme: dark; }
+  html, body { margin: 0; height: 100%; background: #0b0e14; color: #fff; font: 15px/1.45 -apple-system, system-ui, Roboto, sans-serif; overflow: hidden; }
+  video { position: fixed; inset: 0; width: 100%; height: 100%; object-fit: contain; background: #000; transform: scaleX(-1); }
+  video.back { transform: none; }
+  #tally { position: fixed; inset: 0; border: 10px solid transparent; pointer-events: none; transition: border-color .2s; }
+  #badge { position: fixed; top: 14px; left: 50%; transform: translateX(-50%); padding: 4px 16px; border-radius: 6px; font-weight: 700; font-size: 20px; display: none; }
+  #card { position: fixed; left: 50%; top: 50%; transform: translate(-50%, -50%); width: min(92vw, 420px); background: rgba(16,22,36,.92);
+          border: 1px solid #2a3550; border-radius: 16px; padding: 22px; text-align: center; }
+  #card h1 { margin: 0 0 4px; font-size: 22px; }
+  #card p { margin: 6px 0 14px; color: #b0bec5; }
+  input { width: 100%; box-sizing: border-box; padding: 12px; border-radius: 10px; border: 1px solid #3a4560; background: #0b0e14; color: #fff; font-size: 16px; margin-bottom: 12px; }
+  button { padding: 12px 18px; border: 0; border-radius: 10px; color: #fff; font-weight: 700; font-size: 15px; background: #455a64; }
+  #join { width: 100%; background: #c62828; font-size: 17px; }
+  #bar { position: fixed; left: 12px; right: 12px; bottom: 12px; display: none; gap: 8px; align-items: center; flex-wrap: wrap;
+         background: rgba(0,0,0,.6); padding: 10px; border-radius: 12px; }
+  #st { flex: 1 1 100%; font-size: 13px; color: #cfd8dc; }
+  #st.bad { color: #ffab91; }
+</style>
+</head>
+<body>
+<video id="v" playsinline muted autoplay></video>
+<audio id="host" autoplay playsinline></audio>
+<div id="tally"></div>
+<div id="badge"></div>
+<div id="card">
+  <h1>Join the live show</h1>
+  <p id="sub">You've been invited as a guest. Your camera and microphone will be sent to the show's control phone.</p>
+  <input id="name" placeholder="Your name" maxlength="40" autocomplete="name">
+  <button id="join">Join with camera &amp; mic</button>
+  <p style="font-size:12px;margin-top:14px">Tip: use earphones so the show's sound doesn't echo. Hold your phone sideways.</p>
+</div>
+<div id="bar">
+  <button id="mute">Mute mic</button>
+  <button id="flip">Flip camera</button>
+  <button id="leave" style="background:#8e2424">Leave</button>
+  <div id="st">Connecting…</div>
+</div>
+<script>
+'use strict';
+// Free signalling through Supabase Realtime (broadcast only — nothing is stored); video and sound go
+// directly between this browser and the switcher phone (WebRTC peer-to-peer, Google's public STUN).
+const SUPABASE_URL = 'https://jepkzvunetajsgscoelv.supabase.co';
+const SUPABASE_KEY = 'eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9.eyJpc3MiOiJzdXBhYmFzZSIsInJlZiI6ImplcGt6dnVuZXRhanNnc2NvZWx2Iiwicm9sZSI6ImFub24iLCJpYXQiOjE3OTMxMDY0MTMsImV4cCI6MjEwODY4MjQxM30.mdVrmI8-LC-ocgeCgWeX5eZFhWZRiNtxorEBZpCnfRQ';
+const ICE = [{ urls: ['stun:stun.l.google.com:19302', 'stun:stun1.l.google.com:19302', 'stun:stun.cloudflare.com:3478'] }];
+
+const $ = (id) => document.getElementById(id);
+const params = new URLSearchParams(location.hash.slice(1) || location.search.slice(1));
+const room = params.get('r');
+const show = params.get('n');
+const gid = sessionStorage.getItem('sp-gid') || Math.random().toString(36).slice(2, 10);
+sessionStorage.setItem('sp-gid', gid);
+$('name').value = localStorage.getItem('sp-guest-name') || '';
+if (show) $('sub').textContent = `You've been invited as a guest on "${show}". Your camera and microphone will be sent to the show's control phone.`;
+if (!room) { $('sub').textContent = 'This link is incomplete — ask the host for a new guest link.'; $('join').disabled = true; }
+
+let sock = null, ref = 0, joined = false, beat = null;
+let pc = null, stream = null, facing = 'user', answered = false, offerTimer = null, leaving = false, lastSdp = null;
+const topic = 'realtime:sp-guest-' + room;
+const st = (t, bad) => { $('st').textContent = t; $('st').className = bad ? 'bad' : ''; };
+
+// ---------------------------------------------------------------- signalling (Phoenix channel)
+function rt(event, payload, t = topic) { if (sock && sock.readyState === 1) sock.send(JSON.stringify({ topic: t, event, payload, ref: String(++ref) })); }
+function signal(p) { rt('broadcast', { type: 'broadcast', event: 'signal', payload: { ...p, from: gid } }); }
+
+function connectSignal() {
+  return new Promise((resolve) => {
+    sock = new WebSocket(SUPABASE_URL.replace('https', 'wss') + '/realtime/v1/websocket?apikey=' + SUPABASE_KEY + '&vsn=1.0.0');
+    sock.onopen = () => {
+      rt('phx_join', { config: { broadcast: { self: false }, presence: { key: '' } } });
+      clearInterval(beat);
+      beat = setInterval(() => rt('heartbeat', {}, 'phoenix'), 25000);
+    };
+    sock.onmessage = (e) => {
+      const m = JSON.parse(e.data);
+      if (m.event === 'phx_reply' && m.topic === topic && !joined) { joined = true; resolve(); }
+      if (m.event === 'broadcast' && m.payload && m.payload.event === 'signal') onSignal(m.payload.payload);
+    };
+    sock.onclose = () => { joined = false; clearInterval(beat); if (!leaving) setTimeout(() => connectSignal().then(() => { if (!answered) sendOffer(); }), 2000); };
+  });
+}
+
+async function onSignal(m) {
+  if (m.to !== gid) return;
+  if (m.kind === 'answer' && pc && !answered && m.sdp) {
+    answered = true;
+    clearInterval(offerTimer);
+    try { await pc.setRemoteDescription({ type: 'answer', sdp: m.sdp }); st('Connecting to the show…'); }
+    catch (e) { st('Connection error: ' + e.message, true); }
+  } else if (m.kind === 'tally') setTally(m.s);
+  else if (m.kind === 'full') st('The show has no free slot for another guest right now. Ask the host.', true);
+  else if (m.kind === 'bye') { st('The host has removed you from the show. Thank you!'); leave(true); }
+}
+
+// ---------------------------------------------------------------- WebRTC
+async function newPeer() {
+  if (pc) pc.close();
+  answered = false;
+  pc = new RTCPeerConnection({ iceServers: ICE });
+  stream.getTracks().forEach((t) => pc.addTrack(t, stream));
+  pc.ontrack = (e) => { if (e.track.kind === 'audio') { $('host').srcObject = e.streams[0] || new MediaStream([e.track]); $('host').play().catch(() => {}); } };
+  pc.onconnectionstatechange = () => {
+    const s = pc.connectionState;
+    if (s === 'connected') st('You are connected to the show. The host decides when you are on air.');
+    else if (s === 'failed') {
+      st('Could not connect directly — your network may block it. Try Wi-Fi instead of mobile data (or the other way round). Retrying…', true);
+      setTimeout(() => { if (!leaving) restart(); }, 4000);
+    } else if (s === 'disconnected') st('Connection unstable…', true);
+  };
+  // keep the picture sharp but within mobile upload limits
+  const vs = pc.getSenders().find((x) => x.track && x.track.kind === 'video');
+  if (vs) { const p = vs.getParameters(); p.encodings = [{ maxBitrate: 2_500_000 }]; vs.setParameters(p).catch(() => {}); }
+}
+
+async function sendOffer() {
+  if (!pc || answered) return;
+  if (!lastSdp) {
+    const offer = await pc.createOffer();
+    await pc.setLocalDescription(offer);
+    // non-trickle: wait for candidates (max 4 s), send everything in one message
+    await new Promise((r) => { if (pc.iceGatheringState === 'complete') r(); pc.onicegatheringstatechange = () => { if (pc.iceGatheringState === 'complete') r(); }; setTimeout(r, 4000); });
+    lastSdp = pc.localDescription.sdp;
+  }
+  signal({ kind: 'offer', name: $('name').value || 'Guest', sdp: lastSdp });
+  st('Waiting for the show to accept you…');
+}
+
+async function restart() {
+  lastSdp = null;
+  await newPeer();
+  await sendOffer();
+  clearInterval(offerTimer);
+  offerTimer = setInterval(() => { if (!answered) sendOffer(); }, 6000);
+}
+
+function setTally(s) {
+  const t = $('tally'), b = $('badge');
+  if (s === 'pgm') { t.style.borderColor = '#e53935'; b.textContent = '● YOU ARE LIVE'; b.style.background = '#e53935'; b.style.display = 'block'; }
+  else if (s === 'pvw') { t.style.borderColor = '#2e7d32'; b.textContent = 'GET READY'; b.style.background = '#2e7d32'; b.style.display = 'block'; }
+  else { t.style.borderColor = 'transparent'; b.style.display = 'none'; }
+}
+
+async function openMedia() {
+  const s = await navigator.mediaDevices.getUserMedia({
+    video: { facingMode: facing, width: { ideal: 1280 }, height: { ideal: 720 }, frameRate: { ideal: 30 } },
+    audio: { echoCancellation: true, noiseSuppression: true, autoGainControl: true },
+  });
+  $('v').srcObject = s;
+  $('v').className = facing === 'user' ? '' : 'back';
+  return s;
+}
+
+$('join').onclick = async () => {
+  localStorage.setItem('sp-guest-name', $('name').value);
+  $('join').disabled = true;
+  try {
+    stream = await openMedia();
+    $('card').style.display = 'none';
+    $('bar').style.display = 'flex';
+    st('Connecting…');
+    await connectSignal();
+    await restart();
+  } catch (e) {
+    $('join').disabled = false;
+    $('sub').textContent = 'Could not start: ' + (e.message || e) + '. Allow camera and microphone, then try again.';
+  }
+};
+
+$('mute').onclick = () => {
+  const a = stream && stream.getAudioTracks()[0];
+  if (!a) return;
+  a.enabled = !a.enabled;
+  $('mute').textContent = a.enabled ? 'Mute mic' : 'Unmute mic';
+  $('mute').style.background = a.enabled ? '' : '#c62828';
+};
+
+$('flip').onclick = async () => {
+  facing = facing === 'user' ? 'environment' : 'user';
+  try {
+    const s = await openMedia();
+    const nv = s.getVideoTracks()[0];
+    const sender = pc && pc.getSenders().find((x) => x.track && x.track.kind === 'video');
+    if (sender) await sender.replaceTrack(nv);
+    stream.getVideoTracks().forEach((t) => t.stop());
+    stream.removeTrack(stream.getVideoTracks()[0]); stream.addTrack(nv);
+    s.getAudioTracks().forEach((t) => t.stop());
+  } catch (e) { st('Could not switch camera: ' + e.message, true); }
+};
+
+function leave(byHost) {
+  leaving = true;
+  clearInterval(offerTimer);
+  if (!byHost) signal({ kind: 'bye' });
+  if (pc) pc.close();
+  if (stream) stream.getTracks().forEach((t) => t.stop());
+  setTally('off');
+  $('bar').querySelectorAll('button').forEach((b) => { b.style.display = 'none'; });
+  if (!byHost) st('You left the show. Close this page, or reload it to join again.');
+}
+$('leave').onclick = () => leave(false);
+window.addEventListener('pagehide', () => { if (!leaving) signal({ kind: 'bye' }); });
+</script>
+</body>
+</html>
